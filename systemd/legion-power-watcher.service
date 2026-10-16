@@ -1,0 +1,19 @@
+[Unit]
+Description=Lenovo Legion Power Mode Watcher & Auto-Dismiss Notifier
+Documentation=https://github.com/Siwach777/lenovo-power-manager
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/legion-power watch --timeout 1500
+Restart=always
+RestartSec=2
+Slice=background.slice
+
+# Minimal resource limits
+MemoryMax=32M
+CPUWeight=20
+
+[Install]
+WantedBy=graphical-session.target default.target

@@ -1,0 +1,8 @@
+*.o
+*.so
+*.a
+legion-power
+test_*
+build/
+.cache/
+.DS_Store

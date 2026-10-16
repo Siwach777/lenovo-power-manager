@@ -1,0 +1,4 @@
+# /etc/udev/rules.d/99-legion-power.rules
+# Allow users in wheel or video group (or any desktop user) to change ACPI platform_profile without root
+ACTION=="add|change", SUBSYSTEM=="acpi", KERNEL=="platform_profile", RUN+="/usr/bin/chmod 0666 /sys/firmware/acpi/platform_profile"
+SUBSYSTEM=="acpi", ATTR{platform_profile}!="", MODE="0666"
