@@ -164,6 +164,9 @@ void print_list() {
 } // namespace
 
 int main(int argc, char* argv[]) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+
     std::string cmd = (argc > 1) ? argv[1] : "status";
 
     if (cmd == "status") {
@@ -312,7 +315,7 @@ int main(int argc, char* argv[]) {
             ModeInfo info = get_mode_info(new_mode);
             std::cout << "\033[1;36m[Event]\033[0m " << old_mode << " -> " 
                       << info.terminal_color << info.led_emoji << " " << info.name 
-                      << " (" << info.led_color << ")\033[0m\n";
+                      << " (" << info.led_color << ")\033[0m" << std::endl;
             notifier.send_mode_notification(info, old_mode);
         });
 

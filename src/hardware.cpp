@@ -118,6 +118,22 @@ bool write_sysfs_profile(const std::string& mode, std::string& err_msg) {
 
 void record_manual_set() {
     g_last_self_write_ms.store(get_current_time_ms());
+    std::string path = "/tmp/legion-power-manual-set-" + std::to_string(getuid());
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) close(fd);
+}
+
+bool is_recent_manual_set() {
+    std::string path = "/tmp/legion-power-manual-set-" + std::to_string(getuid());
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) {
+        int64_t now_ms = get_current_time_ms();
+        int64_t file_ms = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000 + (st.st_mtim.tv_nsec / 1000000);
+        if ((now_ms - file_ms) < 600) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string read_current_mode() {
@@ -152,6 +168,7 @@ std::vector<std::string> read_available_modes() {
 }
 
 bool write_mode(const std::string& mode, std::string& err_msg) {
+    record_manual_set();
     return write_sysfs_profile(mode, err_msg);
 }
 
@@ -311,7 +328,6 @@ void watch_profile_changes(
     pfd.fd = fd;
     pfd.events = POLLPRI | POLLERR;
 
-    int64_t last_max_power_entry_ms = (current_mode == "max-power") ? get_current_time_ms() : 0;
     int64_t last_event_ms = 0;
 
     while (keep_running.load()) {
@@ -347,16 +363,7 @@ void watch_profile_changes(
                 continue;
             }
 
-            // 3. Hardware EC bounce guard:
-            // When entering max-power, Lenovo EC microcode may emit a trailing bounce write
-            // back to low-power within ~350ms. If this happens, suppress the bounce and re-assert max-power.
-            if (extend_fnq && current_mode == "max-power" && detected == "low-power" && (now_ms - last_max_power_entry_ms) < 350) {
-                std::string err;
-                write_sysfs_profile("max-power", err);
-                continue;
-            }
-
-            // 4. Debounce hardware keypress bursts (< 150ms)
+            // 3. Debounce hardware keypress bursts (< 150ms)
             if ((now_ms - last_event_ms) < 150) {
                 continue;
             }
@@ -365,28 +372,26 @@ void watch_profile_changes(
             std::string old_mode = current_mode;
             std::string target_mode = detected;
 
-            if (extend_fnq) {
-                if (old_mode == "performance" && detected == "low-power") {
-                    // User pressed Fn+Q in Performance mode.
-                    // Hardware EC wrapped to low-power, but extended cycle advances to Extreme (max-power).
-                    std::string err;
-                    if (write_sysfs_profile("max-power", err)) {
-                        target_mode = "max-power";
-                        last_max_power_entry_ms = get_current_time_ms();
-                    }
+            bool manual_set = is_recent_manual_set();
+
+            if (extend_fnq && !manual_set) {
+                // Deterministic 4-stage hardware cycle:
+                // Quiet (low-power) -> Balanced (balanced) -> Performance (performance) -> Extreme (max-power) -> Quiet (low-power)
+                if (old_mode == "low-power") {
+                    target_mode = "balanced";
+                } else if (old_mode == "balanced") {
+                    target_mode = "performance";
+                } else if (old_mode == "performance") {
+                    target_mode = "max-power";
                 } else if (old_mode == "max-power") {
-                    // User was in Extreme and pressed Fn+Q.
-                    // Extended cycle advances to Quiet (low-power).
-                    if (detected != "low-power") {
-                        std::string err;
-                        write_sysfs_profile("low-power", err);
-                    }
                     target_mode = "low-power";
                 }
-            }
 
-            if (target_mode == "max-power") {
-                last_max_power_entry_ms = get_current_time_ms();
+                // Synchronize hardware sysfs profile if it differs from the deterministic target
+                if (detected != target_mode) {
+                    std::string err;
+                    write_sysfs_profile(target_mode, err);
+                }
             }
 
             current_mode = target_mode;
