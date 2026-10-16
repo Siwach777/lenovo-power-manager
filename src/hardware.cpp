@@ -127,9 +127,12 @@ bool is_recent_manual_set() {
     std::string path = "/tmp/legion-power-manual-set-" + std::to_string(getuid());
     struct stat st;
     if (stat(path.c_str(), &st) == 0) {
-        int64_t now_ms = get_current_time_ms();
+        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
         int64_t file_ms = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000 + (st.st_mtim.tv_nsec / 1000000);
-        if ((now_ms - file_ms) < 600) {
+        int64_t diff = now_ms - file_ms;
+        if (diff >= 0 && diff < 600) {
             return true;
         }
     }
