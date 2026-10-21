@@ -161,7 +161,9 @@ bool install_udev_rule(std::string& msg) {
     const char* rule_content = 
         "# Allow unprivileged users to change platform_profile\n"
         "ACTION==\"add|change\", SUBSYSTEM==\"acpi\", KERNEL==\"platform_profile\", RUN+=\"/usr/bin/chmod 0666 /sys/firmware/acpi/platform_profile\"\n"
-        "SUBSYSTEM==\"acpi\", ATTR{platform_profile}!=\"\", MODE=\"0666\"\n";
+        "SUBSYSTEM==\"acpi\", ATTR{platform_profile}!=\"\", MODE=\"0666\"\n\n"
+        "ACTION==\"add|change\", SUBSYSTEM==\"platform-profile\", RUN+=\"/usr/bin/chmod 0666 /sys/class/platform-profile/%k/profile\"\n"
+        "SUBSYSTEM==\"platform-profile\", ATTR{profile}!=\"\", MODE=\"0666\"\n";
 
     std::string temp_file = "/tmp/99-legion-power.rules";
     std::ofstream out(temp_file);
@@ -172,16 +174,34 @@ bool install_udev_rule(std::string& msg) {
     out << rule_content;
     out.close();
 
+    const char* tmpfiles_content =
+        "# Grant non-root write access to platform_profile and fan targets\n"
+        "z /sys/firmware/acpi/platform_profile 0666 root root -\n"
+        "z /sys/class/platform-profile/platform-profile*/profile 0666 root root -\n"
+        "z /sys/class/hwmon/hwmon*/fan*_target 0666 root root -\n";
+
+    std::string temp_tmpfiles = "/tmp/99-legion-power.conf";
+    std::ofstream out_tmp(temp_tmpfiles);
+    if (out_tmp.is_open()) {
+        out_tmp << tmpfiles_content;
+        out_tmp.close();
+    }
+
     std::string cmd = "pkexec sh -c 'cp " + temp_file + " /etc/udev/rules.d/99-legion-power.rules && "
-                      "udevadm control --reload-rules && udevadm trigger && chmod 0666 /sys/firmware/acpi/platform_profile'";
+                      "mkdir -p /etc/tmpfiles.d && cp " + temp_tmpfiles + " /etc/tmpfiles.d/99-legion-power.conf && "
+                      "systemd-tmpfiles --create /etc/tmpfiles.d/99-legion-power.conf 2>/dev/null || true && "
+                      "udevadm control --reload-rules 2>/dev/null || true && udevadm trigger 2>/dev/null || true && "
+                      "chmod 0666 /sys/firmware/acpi/platform_profile 2>/dev/null || true && "
+                      "chmod 0666 /sys/class/platform-profile/platform-profile*/profile 2>/dev/null || true'";
     int ret = std::system(cmd.c_str());
     unlink(temp_file.c_str());
+    unlink(temp_tmpfiles.c_str());
 
     if (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) {
-        msg = "Successfully installed /etc/udev/rules.d/99-legion-power.rules. /sys/firmware/acpi/platform_profile is now writable!";
+        msg = "Successfully installed /etc/udev/rules.d/99-legion-power.rules and /etc/tmpfiles.d/99-legion-power.conf. Platform profile and fan controls are now writable!";
         return true;
     } else {
-        msg = "Failed to install udev rule via pkexec.";
+        msg = "Failed to install udev and tmpfiles rules via pkexec.";
         return false;
     }
 }

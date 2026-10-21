@@ -85,32 +85,123 @@ std::string find_lenovo_hwmon_path() {
     return cached_path;
 }
 
-bool write_sysfs_profile(const std::string& mode, std::string& err_msg) {
-    g_last_self_write_ms.store(get_current_time_ms());
+std::string find_platform_profile_path() {
+    static std::string cached_path;
+    if (!cached_path.empty()) return cached_path;
 
-    int fd = open(SYSFS_PLATFORM_PROFILE, O_WRONLY);
+    // Check modern per-device class sysfs: /sys/class/platform-profile/platform-profile-*/profile
+    DIR* dir = opendir("/sys/class/platform-profile");
+    if (dir) {
+        struct dirent* entry;
+        std::string fallback_profile;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (entry->d_name[0] == '.') continue;
+            std::string base = std::string("/sys/class/platform-profile/") + entry->d_name;
+            std::string name_file = base + "/name";
+            std::string prof_file = base + "/profile";
+            if (access(prof_file.c_str(), F_OK) != 0) continue;
+
+            int fd = open(name_file.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                char buf[64];
+                ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                close(fd);
+                if (n > 0) {
+                    buf[n] = '\0';
+                    std::string dev_name = trim(buf);
+                    if (dev_name == "lenovo-wmi-gamezone" || dev_name.find("lenovo") != std::string::npos) {
+                        cached_path = prof_file;
+                        closedir(dir);
+                        return cached_path;
+                    }
+                }
+            }
+            if (fallback_profile.empty()) {
+                fallback_profile = prof_file;
+            }
+        }
+        closedir(dir);
+        if (!fallback_profile.empty()) {
+            cached_path = fallback_profile;
+            return cached_path;
+        }
+    }
+
+    // Fall back to legacy aggregate ACPI path
+    cached_path = SYSFS_PLATFORM_PROFILE;
+    return cached_path;
+}
+
+std::string find_platform_profile_choices_path() {
+    static std::string cached_path;
+    if (!cached_path.empty()) return cached_path;
+
+    std::string prof = find_platform_profile_path();
+    if (prof.size() > 8 && prof.substr(prof.size() - 8) == "/profile") {
+        std::string choices_file = prof.substr(0, prof.size() - 8) + "/choices";
+        if (access(choices_file.c_str(), R_OK) == 0) {
+            cached_path = choices_file;
+            return cached_path;
+        }
+    }
+
+    if (access(SYSFS_PLATFORM_PROFILE_CHOICES, R_OK) == 0) {
+        cached_path = SYSFS_PLATFORM_PROFILE_CHOICES;
+        return cached_path;
+    }
+
+    cached_path = prof;
+    return cached_path;
+}
+
+bool write_sysfs_profile(const std::string& mode, std::string& err_msg) {
+    std::string primary_path = find_platform_profile_path();
+    const char* legacy_path = SYSFS_PLATFORM_PROFILE;
+
+    // 1. Direct write attempt to the primary target file (e.g. /sys/class/platform-profile/platform-profile-0/profile)
+    int fd = open(primary_path.c_str(), O_WRONLY);
     if (fd >= 0) {
         std::string payload = mode + "\n";
         ssize_t written = write(fd, payload.c_str(), payload.size());
         close(fd);
         if (written == static_cast<ssize_t>(payload.size())) {
+            g_last_self_write_ms.store(get_current_time_ms());
             return true;
         }
     }
 
+    // 2. If primary target file was not directly writable without root, and mode != "custom",
+    // check if legacy aggregate path is directly writable (since it may already have 0666 permissions).
+    // NOTE: Writing "custom" to legacy aggregate /sys/firmware/acpi/platform_profile returns -EINVAL
+    // in Linux kernel 6.13+ because aggregate sysfs explicitly rejects PLATFORM_PROFILE_CUSTOM.
+    if (mode != "custom" && primary_path != legacy_path) {
+        int fd_leg = open(legacy_path, O_WRONLY);
+        if (fd_leg >= 0) {
+            std::string payload = mode + "\n";
+            ssize_t written = write(fd_leg, payload.c_str(), payload.size());
+            close(fd_leg);
+            if (written == static_cast<ssize_t>(payload.size())) {
+                g_last_self_write_ms.store(get_current_time_ms());
+                return true;
+            }
+        }
+    }
+
+    // 3. Fallback to privilege escalation (pkexec or sudo) to write to primary_path
     if (errno == EACCES || errno == EPERM || fd < 0) {
         const char* helper = (isatty(STDIN_FILENO) && std::getenv("SUDO_USER") == nullptr) ? "pkexec" : "sudo";
-        std::string cmd = std::string(helper) + " sh -c 'echo \"" + mode + "\" > " + SYSFS_PLATFORM_PROFILE + "'";
+        std::string cmd = std::string(helper) + " sh -c 'echo \"" + mode + "\" > " + primary_path + "'";
         int ret = std::system(cmd.c_str());
         if (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) {
+            g_last_self_write_ms.store(get_current_time_ms());
             return true;
         }
-        err_msg = "Permission denied writing to " + std::string(SYSFS_PLATFORM_PROFILE) + 
-                  ". Run with sudo/pkexec or run ./install.sh to apply udev permissions.";
+        err_msg = "Permission denied writing to " + primary_path + 
+                  ". Run with sudo/pkexec or run ./install.sh to apply udev and tmpfiles permissions.";
         return false;
     }
 
-    err_msg = "Failed to write to " + std::string(SYSFS_PLATFORM_PROFILE) + ": " + std::strerror(errno);
+    err_msg = "Failed to write to " + primary_path + ": " + std::strerror(errno);
     return false;
 }
 
@@ -118,29 +209,49 @@ bool write_sysfs_profile(const std::string& mode, std::string& err_msg) {
 
 void record_manual_set() {
     g_last_self_write_ms.store(get_current_time_ms());
-    std::string path = "/tmp/legion-power-manual-set-" + std::to_string(getuid());
-    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd >= 0) close(fd);
+    std::string uid_path = "/tmp/legion-power-manual-set-" + std::to_string(getuid());
+    int fd1 = open(uid_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd1 >= 0) {
+        fchmod(fd1, 0666);
+        close(fd1);
+    }
+    int fd2 = open("/tmp/legion-power-manual-set", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd2 >= 0) {
+        fchmod(fd2, 0666);
+        close(fd2);
+    }
 }
 
 bool is_recent_manual_set() {
-    std::string path = "/tmp/legion-power-manual-set-" + std::to_string(getuid());
-    struct stat st;
-    if (stat(path.c_str(), &st) == 0) {
-        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()
-        ).count();
-        int64_t file_ms = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000 + (st.st_mtim.tv_nsec / 1000000);
-        int64_t diff = now_ms - file_ms;
-        if (diff >= 0 && diff < 600) {
-            return true;
+    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+
+    auto check_file = [&](const std::string& path) -> bool {
+        struct stat st;
+        if (stat(path.c_str(), &st) == 0) {
+            int64_t file_ms = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000 + (st.st_mtim.tv_nsec / 1000000);
+            int64_t diff = now_ms - file_ms;
+            if (diff >= 0 && diff < 1500) {
+                return true;
+            }
         }
-    }
+        return false;
+    };
+
+    if (check_file("/tmp/legion-power-manual-set")) return true;
+    if (check_file("/tmp/legion-power-manual-set-" + std::to_string(getuid()))) return true;
+    if (check_file("/tmp/legion-power-manual-set-0")) return true;
+
     return false;
 }
 
 std::string read_current_mode() {
-    int fd = open(SYSFS_PLATFORM_PROFILE, O_RDONLY);
+    std::string path = find_platform_profile_path();
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0 && path != SYSFS_PLATFORM_PROFILE) {
+        fd = open(SYSFS_PLATFORM_PROFILE, O_RDONLY);
+    }
     if (fd < 0) return "unknown";
     char buf[128];
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
@@ -152,7 +263,11 @@ std::string read_current_mode() {
 
 std::vector<std::string> read_available_modes() {
     std::vector<std::string> modes;
-    int fd = open(SYSFS_PLATFORM_PROFILE_CHOICES, O_RDONLY);
+    std::string path = find_platform_profile_choices_path();
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0 && path != SYSFS_PLATFORM_PROFILE_CHOICES) {
+        fd = open(SYSFS_PLATFORM_PROFILE_CHOICES, O_RDONLY);
+    }
     if (fd < 0) {
         return {"low-power", "balanced", "performance", "max-power", "custom"};
     }
@@ -181,6 +296,7 @@ std::string get_next_mode() {
     if (curr == "balanced") return "performance";
     if (curr == "performance") return "max-power";
     if (curr == "max-power") return "low-power";
+    if (curr == "custom") return "low-power";
     return "balanced";
 }
 
@@ -317,9 +433,14 @@ void watch_profile_changes(
     bool extend_fnq,
     const std::function<void(const std::string& new_mode, const std::string& old_mode)>& on_change
 ) {
-    int fd = open(SYSFS_PLATFORM_PROFILE, O_RDONLY);
+    std::string watch_path = find_platform_profile_path();
+    int fd = open(watch_path.c_str(), O_RDONLY);
+    if (fd < 0 && watch_path != SYSFS_PLATFORM_PROFILE) {
+        watch_path = SYSFS_PLATFORM_PROFILE;
+        fd = open(watch_path.c_str(), O_RDONLY);
+    }
     if (fd < 0) {
-        std::cerr << "[Error] Cannot open " << SYSFS_PLATFORM_PROFILE << " for monitoring: " << std::strerror(errno) << "\n";
+        std::cerr << "[Error] Cannot open " << watch_path << " for monitoring: " << std::strerror(errno) << "\n";
         return;
     }
 
@@ -332,6 +453,7 @@ void watch_profile_changes(
     pfd.events = POLLPRI | POLLERR;
 
     int64_t last_event_ms = 0;
+    int64_t last_max_power_entry_ms = 0;
 
     while (keep_running.load()) {
         int ret = poll(&pfd, 1, 200);
@@ -344,7 +466,7 @@ void watch_profile_changes(
 
         if (lseek(fd, 0, SEEK_SET) == (off_t)-1) {
             close(fd);
-            fd = open(SYSFS_PLATFORM_PROFILE, O_RDONLY);
+            fd = open(watch_path.c_str(), O_RDONLY);
             if (fd < 0) break;
             pfd.fd = fd;
         }
@@ -361,13 +483,25 @@ void watch_profile_changes(
                 continue;
             }
 
-            // 2. Ignore sysfs events triggered by our own writes within 150ms
-            if ((now_ms - g_last_self_write_ms.load()) < 150) {
+            // 2. Ignore sysfs events triggered by our own writes within 200ms
+            if ((now_ms - g_last_self_write_ms.load()) < 200) {
                 continue;
             }
 
-            // 3. Debounce hardware keypress bursts (< 150ms)
-            if ((now_ms - last_event_ms) < 150) {
+            // 3. Hardware EC bounce guard:
+            // When entering max-power, Lenovo Legion EC microcode natively defaults to low-power (Quiet mode)
+            // upon the physical Fn+Q keystroke. When overridden to max-power, the EC's internal hardware
+            // routine finishes 150-500ms later and may emit a trailing bounce back to low-power.
+            // If this trailing bounce event arrives while in max-power within 600ms, suppress the bounce,
+            // re-assert max-power to sysfs, and prevent the state machine from dropping to low-power.
+            if (extend_fnq && current_mode == "max-power" && detected == "low-power" && (now_ms - last_max_power_entry_ms) < 600) {
+                std::string err;
+                write_sysfs_profile("max-power", err);
+                continue;
+            }
+
+            // 4. Debounce hardware keypress bursts (< 200ms)
+            if ((now_ms - last_event_ms) < 200) {
                 continue;
             }
             last_event_ms = now_ms;
@@ -377,7 +511,14 @@ void watch_profile_changes(
 
             bool manual_set = is_recent_manual_set();
 
-            if (extend_fnq && !manual_set) {
+            // 5. Custom mode handling vs Hardware Fn+Q cycle:
+            // The physical Fn+Q hardware keystroke on Lenovo Legion firmware NEVER triggers "custom".
+            // Custom mode can ONLY be activated via software/manual set.
+            // Therefore, if detected is "custom", it is ALWAYS an intentional external set and
+            // must NEVER be overridden by the Fn+Q cycle state machine.
+            if (detected == "custom") {
+                target_mode = "custom";
+            } else if (extend_fnq && !manual_set) {
                 // Deterministic 4-stage hardware cycle:
                 // Quiet (low-power) -> Balanced (balanced) -> Performance (performance) -> Extreme (max-power) -> Quiet (low-power)
                 if (old_mode == "low-power") {
@@ -388,13 +529,25 @@ void watch_profile_changes(
                     target_mode = "max-power";
                 } else if (old_mode == "max-power") {
                     target_mode = "low-power";
+                } else if (old_mode == "custom") {
+                    // When in Custom mode and user presses physical Fn+Q, cycle to Quiet (low-power)
+                    target_mode = "low-power";
                 }
 
                 // Synchronize hardware sysfs profile if it differs from the deterministic target
                 if (detected != target_mode) {
                     std::string err;
-                    write_sysfs_profile(target_mode, err);
+                    if (!write_sysfs_profile(target_mode, err)) {
+                        std::cerr << "[Watcher Error] Failed to write " << target_mode 
+                                  << " to " << watch_path << ": " << err << "\n";
+                        current_mode = detected;
+                        continue;
+                    }
                 }
+            }
+
+            if (target_mode == "max-power") {
+                last_max_power_entry_ms = now_ms;
             }
 
             current_mode = target_mode;

@@ -18,11 +18,13 @@ systemctl --user daemon-reload 2>/dev/null || true
 if [ "$EUID" -eq 0 ]; then
     rm -f /usr/local/bin/legion-power /usr/local/bin/power-manager
     rm -f /etc/udev/rules.d/99-legion-power.rules
+    rm -f /etc/tmpfiles.d/99-legion-power.conf
     udevadm control --reload-rules 2>/dev/null || true
 else
     if command -v sudo >/dev/null 2>&1; then
         sudo rm -f /usr/local/bin/legion-power /usr/local/bin/power-manager
         sudo rm -f /etc/udev/rules.d/99-legion-power.rules
+        sudo rm -f /etc/tmpfiles.d/99-legion-power.conf
         sudo udevadm control --reload-rules 2>/dev/null || true
     fi
     rm -f "$HOME/.local/bin/legion-power" "$HOME/.local/bin/power-manager"

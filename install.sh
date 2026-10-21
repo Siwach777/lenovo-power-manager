@@ -67,20 +67,30 @@ else
     fi
 fi
 
-# 5. Install udev rule for passwordless switching
-echo -e "${BLUE}--> Configuring udev rule for /sys/firmware/acpi/platform_profile...${RESET}"
-if [ -f "udev/99-legion-power.rules" ]; then
-    if [ "$EUID" -eq 0 ]; then
-        cp udev/99-legion-power.rules /etc/udev/rules.d/
-        udevadm control --reload-rules 2>/dev/null || true
-        udevadm trigger 2>/dev/null || true
-        chmod 0666 /sys/firmware/acpi/platform_profile 2>/dev/null || true
-    elif command -v sudo >/dev/null 2>&1; then
-        sudo cp udev/99-legion-power.rules /etc/udev/rules.d/
-        sudo udevadm control --reload-rules 2>/dev/null || true
-        sudo udevadm trigger 2>/dev/null || true
-        sudo chmod 0666 /sys/firmware/acpi/platform_profile 2>/dev/null || true
+# 5. Install udev rule and systemd-tmpfiles configuration for passwordless switching
+echo -e "${BLUE}--> Configuring permissions for /sys/firmware/acpi/platform_profile...${RESET}"
+if [ "$EUID" -eq 0 ]; then
+    [ -f "udev/99-legion-power.rules" ] && cp udev/99-legion-power.rules /etc/udev/rules.d/
+    if [ -f "systemd/99-legion-power.conf" ]; then
+        install -d /etc/tmpfiles.d
+        cp systemd/99-legion-power.conf /etc/tmpfiles.d/
+        systemd-tmpfiles --create /etc/tmpfiles.d/99-legion-power.conf 2>/dev/null || true
     fi
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger 2>/dev/null || true
+    chmod 0666 /sys/firmware/acpi/platform_profile 2>/dev/null || true
+    chmod 0666 /sys/class/platform-profile/platform-profile*/profile 2>/dev/null || true
+elif command -v sudo >/dev/null 2>&1; then
+    [ -f "udev/99-legion-power.rules" ] && sudo cp udev/99-legion-power.rules /etc/udev/rules.d/
+    if [ -f "systemd/99-legion-power.conf" ]; then
+        sudo install -d /etc/tmpfiles.d
+        sudo cp systemd/99-legion-power.conf /etc/tmpfiles.d/
+        sudo systemd-tmpfiles --create /etc/tmpfiles.d/99-legion-power.conf 2>/dev/null || true
+    fi
+    sudo udevadm control --reload-rules 2>/dev/null || true
+    sudo udevadm trigger 2>/dev/null || true
+    sudo chmod 0666 /sys/firmware/acpi/platform_profile 2>/dev/null || true
+    sudo chmod 0666 /sys/class/platform-profile/platform-profile*/profile 2>/dev/null || true
 fi
 
 # 6. Install and restart systemd user service for background watcher (auto-start on boot)
